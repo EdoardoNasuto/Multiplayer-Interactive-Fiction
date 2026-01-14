@@ -1,0 +1,1167 @@
+:: StoryTitle
+Multiplayer Interactive Fiction | Twine Extension (MIF-T)
+
+:: StoryData
+{
+    "ifid": "b7e3c2a1-4f6e-4b2a-8c9d-1e2f3a4b5c6d",
+    "format": "SugarCube",
+    "format-version": "2.37.3",
+    "start": "Start",
+    "tag-colors": {
+        "configuration": "yellow",
+        "character": "orange",
+        "exclusive": "red",
+        "individual": "green",
+        "leader": "purple",
+        "majority": "blue"
+    },
+    "zoom": 1
+}
+
+:: StoryStylesheet [stylesheet]
+a.link-disabled {
+    pointer-events: none;
+    color: #555 !important;
+    text-decoration: line-through;
+    cursor: not-allowed;
+    border-bottom: none;
+}
+
+.decision-info {
+    border: 1px solid #444;
+    background: #222;
+    padding: 15px;
+    margin-bottom: 20px;
+    color: #aaa;
+    font-size: 0.9em;
+    text-align: center;
+    box-shadow: 0 0 10px rgba(0,0,0,0.5);
+}
+.decision-info b { color: #fff; font-size: 1.1em; text-transform: uppercase; }
+
+.timer { position: sticky; top: 10px; height: 12px; background: #eee; }
+
+.timer-fill { height: 100%; animation: shrink linear; }
+@keyframes shrink {
+    0% { width: 100%; background-color: #4cd964; }
+    50% { width: 50%; background-color: #ffcc00; }
+    100% { width: 0%; background-color: #ff3b30; }
+}
+
+.waiting-screen { text-align: center; font-family: monospace; margin-top: 20%; }
+
+:: StoryScript [script]
+if (!window.Peer) {
+    var script = document.createElement('script');
+    script.src = "https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js";
+    document.head.appendChild(script);
+}
+window.addEventListener("beforeunload", function (e) { e.preventDefault(); e.returnValue = "" });
+Config.history.controls = false;
+
+/**
+ * ===============================
+ * MODULE : INIT STATE
+ * ===============================
+ *
+ * Ce module initialise l'état global du jeu multijoueur.
+ * Il définit les variables de session, les structures de choix, la gestion des groupes,
+ * et prépare l'objet setup.p2p pour la gestion réseau et utilisateur.
+ *
+ * - State.variables.players : liste des joueurs connectés
+ * - State.variables.targetHostId : identifiant de l'hôte cible pour la connexion P2P
+ * - State.variables.choices : structure de stockage des choix par mode (exclusive, individual, leader, majority)
+ * - State.variables.leaders : mapping passage -> leader
+ * - State.variables.pendingMoves : mouvements en attente de validation
+ *
+ * Ce module pose les bases de la synchronisation et de la logique multijoueur.
+ */
+// --- Session variables ---
+State.variables.players = {};
+State.variables.targetHostId = "";
+
+// --- Choice variables ---
+State.variables.choices = {
+    exclusive: {},  // { id_player: passage }
+    individual: {}, // { id_player: passage }
+    leader: {},     // { id_player: passage }
+    majority: {}    // { id_player: vote }
+};
+
+// --- Group management variables ---
+State.variables.leaders = {};           // Map: Passage -> LeaderName
+State.variables.pendingMoves = {};      // Résultat final validé par le système avant déplacement
+
+setup.p2p = { user: { id: null, isHost: false } };
+
+/**
+ * ===============================
+ * MODULE : STATE
+ * ===============================
+ *
+ * Ce module centralise l'accès et la modification de l'état global du jeu.
+ * Il fournit des méthodes utilitaires pour :
+ *   - Accéder à toutes les variables de session
+ *   - Gérer les joueurs (ajout, récupération, attribution de personnage)
+ *   - Gérer les choix des joueurs selon les différents modes
+ *   - Gérer les leaders et les mouvements en attente
+ *
+ * Ce module garantit la cohérence de l'état partagé entre tous les clients.
+ */
+const STATE = {
+    get v() { return State.variables; },
+
+    isHost: () => setup.p2p.user.isHost,
+    myId: () => setup.p2p.user.id,
+
+    // --- Global State Access ---
+    getAll: () => State.variables,
+    replaceAll: (newState) => {
+        Object.keys(State.variables).forEach(k => delete State.variables[k]);
+        Object.assign(State.variables, newState);
+    },
+
+    // --- Players ---
+    getPlayers: () => STATE.v.players,
+    getPlayer: (id) => STATE.v.players[id],
+    addPlayer: (id) => STATE.v.players[id] ??= { char: null },
+    setPlayerChar: (id, charName) => { if (STATE.v.players[id]) STATE.v.players[id].char = charName; },
+    getMyCharName: () => STATE.v.players[setup.p2p.user.id]?.char ?? null,
+
+    // --- Target Host ---
+    getTargetHostId: () => STATE.v.targetHostId,
+    setTargetHostId: (id) => STATE.v.targetHostId = id,
+
+    // --- Characters ---
+    getCharacters: () => STATE.v.characters,
+    getCharacter: (name) => STATE.v.characters?.find(c => c.name === name),
+
+    // --- Generic Choices Management ---
+    getChoices: (mode) => STATE.v.choices[mode] ?? {},
+    setChoice: (mode, id, value) => { if (STATE.v.choices[mode]) STATE.v.choices[mode][id] = value; },
+    removeChoice: (mode, id) => { if (STATE.v.choices[mode]) delete STATE.v.choices[mode][id]; },
+
+    // --- Leaders Config ---
+    getLeaders: () => STATE.v.leaders,
+    getLeaderForPassage: (passageName) => STATE.v.leaders[passageName],
+
+    // --- Pending Moves ---
+    getPendingMoves: () => STATE.v.pendingMoves,
+    getPendingMove: (passageName) => STATE.v.pendingMoves[passageName],
+    setPendingMove: (passageName, value) => STATE.v.pendingMoves[passageName] = value,
+    removePendingMove: (passageName) => delete STATE.v.pendingMoves[passageName],
+
+    addPendingMoveDest: (passageName, pid, dest) => {
+        (STATE.v.pendingMoves[passageName] ??= {})[pid] = dest;
+    }
+};
+
+/**
+ * ===============================
+ * MODULE : UI
+ * ===============================
+ *
+ * Ce module gère l'interface utilisateur dynamique côté client.
+ * Il propose des fonctions pour :
+ *   - Rafraîchir le nombre de joueurs dans le lobby
+ *   - Désactiver les liens ou personnages déjà pris
+ *   - Appliquer des effets visuels selon le mode de décision (ex : leader)
+ *   - Rafraîchir l'ensemble de l'UI selon l'état courant
+ *
+ * Il s'assure que l'interface reflète toujours l'état du jeu et les contraintes multijoueur.
+ */
+const UI = {
+    refreshLobbyCount: function () {
+        if (document.getElementById("player-count")) {
+            const count = Object.keys(STATE.getPlayers()).length;
+            new Wikifier(null, `<<replace "#player-count">>${count}<</replace>>`);
+        }
+    },
+
+    lockTakenCharacters: function (characters) {
+        if (!characters) return;
+        characters.forEach(c => {
+            if (c.taken) {
+                $('a.link-internal').filter((i, el) => $(el).text() === c.name).addClass('link-disabled');
+            }
+        });
+    },
+
+    lockTakenLinks: function () {
+        const taken = Object.values(STATE.getChoices('exclusive') || {});
+        if (taken.length === 0) return;
+
+        $(".link-internal").each(function () {
+            var dest = $(this).attr("data-passage");
+            if (taken.includes(dest)) {
+                $(this).addClass("link-disabled");
+            }
+        });
+    },
+
+    applyLeaderVisuals: function (leaderName, myCharName) {
+        if (myCharName !== leaderName) {
+            $(".link-internal").addClass("link-disabled");
+        }
+    },
+
+    refreshAll: function () {
+        UI.refreshLobbyCount();
+        UI.lockTakenCharacters(STATE.getCharacters());
+        if (tags().includes("exclusive")) {
+            UI.lockTakenLinks();
+        }
+    }
+};
+
+/* --- MESSAGES --- */
+const MSG = {
+    SYNC_DATA: 'SYNC_DATA',
+    GOTO: 'GOTO',
+    PICK_CHAR: 'PICK_CHAR',
+    SUBMIT: 'SUBMIT',
+};
+
+/**
+ * ===============================
+ * MODULE : NETWORK (NET)
+ * ===============================
+ *
+ * Ce module encapsule toute la logique réseau Peer-to-Peer (P2P) via PeerJS.
+ * Il gère :
+ *   - L'initialisation du peer (hôte ou client)
+ *   - La connexion à l'hôte ou l'acceptation de connexions entrantes
+ *   - La configuration des connexions et la gestion des messages entrants
+ *   - La diffusion de l'état et des messages à tous les clients
+ *
+ * Il assure la synchronisation des variables et la communication entre tous les participants.
+ */
+const NET = {
+    peer: null,
+    conns: [],
+    hostConn: null,
+
+    init: function (isHostMode = false) {
+        setup.p2p.user.isHost = isHostMode;
+        NET.peer = new Peer(null);
+
+        NET.peer.on('open', (id) => {
+            setup.p2p.user.id = id;
+            if (setup.p2p.user.isHost) {
+                STATE.addPlayer(id);
+            } else {
+                NET.connectToHost(STATE.getTargetHostId());
+            }
+            Engine.play(passage());
+        });
+
+        NET.peer.on('connection', (conn) => {
+            if (STATE.isHost()) {
+                NET.conns.push(conn);
+                NET.configureConnection(conn);
+                STATE.addPlayer(conn.peer);
+                conn.send({ type: MSG.SYNC_DATA, state: STATE.getAll() });
+                NET.broadcastState();
+                UI.refreshLobbyCount();
+            }
+        });
+
+        NET.peer.on('error', (err) => {
+            console.error(err);
+            alert("Erreur réseau : " + err.type);
+        });
+    },
+
+    connectToHost: function (hostId) {
+        const conn = NET.peer.connect(hostId);
+        NET.hostConn = conn;
+        NET.configureConnection(conn);
+    },
+
+    sendToHost: function (msg) {
+        if (NET.hostConn) NET.hostConn.send(msg);
+    },
+
+    broadcastState: function () {
+        const packet = { type: MSG.SYNC_DATA, state: STATE.getAll() };
+        NET.conns.forEach(c => c.send(packet));
+    },
+
+    broadcast: function (msg) {
+        NET.conns.forEach(c => c.send(msg));
+    },
+
+    handlers: {
+        [MSG.SYNC_DATA]: (data) => {
+            STATE.replaceAll(data.state);
+            UI.refreshAll();
+        },
+
+        [MSG.GOTO]: (data) => {
+            if (data.state) {
+                STATE.replaceAll(data.state);
+            }
+            GAME.forceNavigate(data.passage);
+        },
+        [MSG.PICK_CHAR]: (data, sender) => GAME.handleCharPick(sender, data.charName),
+
+        [MSG.SUBMIT]: (data, sender) => {
+            if (!STATE.isHost()) return;
+            const mode = data.mode;
+            const choice = data.choice;
+            const config = GAME.DECISION_MODES[mode];
+            if (config && typeof config.handler === 'function') {
+                try { config.handler(sender, choice); }
+                catch (e) { console.error('Error in handler for mode', mode, e); }
+            }
+        }
+    },
+
+    configureConnection: function (conn) {
+        conn.on('data', (data) => {
+            const handler = NET.handlers[data.type];
+            if (handler) {
+                if (!STATE.isHost() && [MSG.PICK_CHAR, MSG.SUBMIT].includes(data.type)) return;
+                handler(data, conn.peer);
+            }
+        });
+    }
+};
+
+const DEFAULT_MODE = 'individual'; // Définit le mode de décision par défaut utilisé pour les passages sans tag spécifique.
+
+/**
+ * ===============================
+ * MODULE : GAME
+ * ===============================
+ *
+ * Ce module regroupe toute la logique de résolution des choix et de navigation.
+ * Il définit :
+ *   - Les différents modes de décision (exclusive, individual, leader, majority) et leurs handlers
+ *   - Les fonctions de soumission et de traitement des choix
+ *   - La gestion des groupes actifs, la résolution des décisions, et la navigation forcée
+ *   - L'application des impacts logiques (macros impact/characters)
+ *
+ * Ce module orchestre le déroulement du jeu multijoueur et la synchronisation des transitions.
+ */
+const GAME = {
+    DECISION_MODES: {
+        exclusive: {
+            handler: (playerId, choice) => {
+                const charName = STATE.getPlayer(playerId)?.char;
+                const charObj = STATE.getCharacter(charName);
+                if (!charObj) return;
+
+                const playersInRoom = GAME.getPlayersInPassage(charObj.location);
+                const exclusiveChoices = STATE.getChoices('exclusive');
+                const isTaken = playersInRoom.some(pid => exclusiveChoices[pid] === choice);
+
+                if (!isTaken) {
+                    STATE.setChoice('exclusive', playerId, choice);
+                    if (STATE.isHost()) UI.refreshAll();
+                    GAME.checkPendingMoves();
+                }
+                NET.broadcastState();
+            },
+            ready: (players) => players.every(pid => STATE.getChoices('exclusive')[pid] !== undefined),
+            resolve: (players, passageName) => {
+                const choices = STATE.getChoices('exclusive');
+                players.forEach(pid => {
+                    const dest = choices[pid];
+                    if (dest) {
+                        STATE.addPendingMoveDest(passageName, pid, dest);
+                        STATE.removeChoice('exclusive', pid);
+                    }
+                });
+            }
+        },
+        individual: {
+            handler: (playerId, choice) => {
+                STATE.setChoice('individual', playerId, choice);
+                GAME.checkPendingMoves();
+            },
+            ready: (players) => players.every(pid => STATE.getChoices('individual')[pid] !== undefined),
+            resolve: (players, passageName) => {
+                const choices = STATE.getChoices('individual');
+                players.forEach(pid => {
+                    const dest = choices[pid];
+                    if (dest) {
+                        STATE.addPendingMoveDest(passageName, pid, dest);
+                        STATE.removeChoice('individual', pid);
+                    }
+                });
+            }
+        },
+        leader: {
+            handler: (playerId, choice) => {
+                STATE.setChoice('leader', playerId, choice);
+                const charName = STATE.getPlayer(playerId)?.char;
+                const c = STATE.getCharacter(charName);
+                if (c?.location) {
+                    STATE.setPendingMove(c.location, choice);
+                    STATE.removeChoice('leader', playerId);
+                    GAME.checkPendingMoves();
+                }
+            },
+            ready: (players) => players.some(pid => STATE.getChoices('leader')[pid] !== undefined),
+            resolve: (players, passageName) => {
+                // Resolution is handled directly by the handler which defines a global PendingMove
+            }
+        },
+        majority: {
+            handler: (playerId, choice) => {
+                const charName = STATE.getPlayer(playerId)?.char;
+                const c = STATE.getCharacter(charName);
+                if (c?.location) {
+                    STATE.setChoice('majority', playerId, choice);
+                    GAME.checkPendingMoves();
+                }
+            },
+            ready: (players) => players.every(pid => STATE.getChoices('majority')[pid] !== undefined),
+            resolve: (players, passageName) => {
+                const validVotes = {};
+                const majorityChoices = STATE.getChoices('majority');
+
+                players.forEach(pid => {
+                    if (majorityChoices[pid]) validVotes[pid] = majorityChoices[pid];
+                });
+
+                if (players.length > 0 && Object.keys(validVotes).length >= players.length) {
+                    const counts = {};
+                    let max = -1;
+
+                    Object.values(validVotes).forEach(v => {
+                        counts[v] = (counts[v] || 0) + 1;
+                        if (counts[v] > max) max = counts[v];
+                    });
+
+                    const winners = Object.keys(counts).filter(v => counts[v] === max);
+                    const winner = winners[Math.floor(Math.random() * winners.length)];
+
+                    players.forEach(pid => STATE.removeChoice('majority', pid));
+                    STATE.setPendingMove(passageName, winner);
+                }
+            }
+        }
+    },
+
+    isSystemMove: false,
+
+    forceNavigate: function (passage) {
+        GAME.isSystemMove = true;
+        Engine.play(passage);
+    },
+
+    submitCharPick: function (charName) {
+        if (STATE.isHost()) GAME.handleCharPick(STATE.myId(), charName);
+        else NET.sendToHost({ type: MSG.PICK_CHAR, charName: charName });
+    },
+
+    handleCharPick: function (playerId, charName) {
+        const charObj = STATE.getCharacter(charName);
+        if (!charObj || charObj.taken) return;
+
+        charObj.taken = true;
+        STATE.setPlayerChar(playerId, charName);
+
+        NET.broadcastState();
+        if (STATE.isHost()) UI.lockTakenCharacters(STATE.getCharacters());
+
+        const allPlayers = Object.values(STATE.getPlayers());
+        const allReady = allPlayers.length > 0 &&
+            allPlayers.every(p => p.char !== null) &&
+            STATE.getMyCharName() !== null;
+
+        if (allReady && STATE.isHost()) {
+            setTimeout(() => {
+                Object.entries(STATE.getPlayers()).forEach(([pid, p]) => {
+                    const char = STATE.getCharacter(p.char);
+                    char.location = "Introduction";
+                    if (char) GAME.executeMove([pid], char.location);
+                });
+            }, 100);
+        }
+    },
+
+    // --- RESOLUTION LOGIC ---
+    getPlayersInPassage: function (passage) {
+        const ids = [];
+        const players = STATE.getPlayers();
+        Object.keys(players).forEach(pid => {
+            const charName = players[pid].char;
+            const c = STATE.getCharacter(charName);
+            if (c && c.location === passage) ids.push(pid);
+        });
+        return ids;
+    },
+
+    getActiveGroups: function () {
+        const groups = new Set();
+        Object.values(STATE.getPlayers()).forEach(p => {
+            const c = STATE.getCharacter(p.char);
+            if (c?.location) groups.add(c.location);
+        });
+        return Array.from(groups);
+    },
+
+    checkPendingMoves: function () {
+        if (!STATE.isHost()) return;
+
+        const activePassages = this.getActiveGroups();
+        let allReady = true;
+
+        for (let passageName of activePassages) {
+            if (STATE.getPendingMove(passageName)) continue;
+
+            const players = this.getPlayersInPassage(passageName);
+            if (players.length === 0) continue;
+
+            const tagsList = Story.get(passageName).tags;
+            const tag = tagsList.find(t => GAME.DECISION_MODES[t]) || DEFAULT_MODE;
+
+            let groupReady = false;
+            if (tag && GAME.DECISION_MODES[tag].ready) {
+                groupReady = GAME.DECISION_MODES[tag].ready(players);
+            }
+
+            if (!groupReady) { allReady = false; break; }
+        }
+
+        if (allReady) {
+            setTimeout(() => {
+                this.resolveDecisions(activePassages);
+            }, 100);
+        }
+    },
+
+    resolveDecisions: function (activePassages) {
+        const movesToExecute = {}; // Map: { Destination -> [PlayerIDs] }
+
+        activePassages.forEach(passageName => {
+            const players = this.getPlayersInPassage(passageName);
+            const tagsList = Story.get(passageName).tags;
+            const tag = tagsList.find(t => GAME.DECISION_MODES[t]) || DEFAULT_MODE;
+
+            if (tag && GAME.DECISION_MODES[tag].resolve) {
+                GAME.DECISION_MODES[tag].resolve(players, passageName);
+            }
+
+            const pendingMove = STATE.getPendingMove(passageName);
+
+            if (pendingMove) {
+                this._aggregateMoves(movesToExecute, pendingMove, players);
+                STATE.removePendingMove(passageName);
+            }
+        });
+
+        this.finalizeMoves(movesToExecute);
+    },
+
+    finalizeMoves: function (movesToExecute) {
+        const destinations = Object.keys(movesToExecute);
+
+        destinations.forEach(dest => {
+            const playerIds = movesToExecute[dest];
+            playerIds.forEach(pid => {
+                const charName = STATE.getPlayer(pid)?.char;
+                const charObj = STATE.getCharacter(charName);
+                if (charObj) charObj.location = dest;
+            });
+        });
+
+        destinations.forEach(dest => {
+            this.simulateLogic(dest);
+        });
+
+        destinations.forEach(dest => {
+            this.executeMove(movesToExecute[dest], dest);
+        });
+
+        NET.broadcastState();
+    },
+
+    _aggregateMoves: function (movesMap, pendingMove, playersInOrigin) {
+        if (typeof pendingMove === 'object') {
+            Object.entries(pendingMove).forEach(([pid, dest]) => {
+                if (!movesMap[dest]) movesMap[dest] = [];
+                movesMap[dest].push(pid);
+            });
+        } else {
+            const dest = pendingMove;
+            if (!movesMap[dest]) movesMap[dest] = [];
+            movesMap[dest] = movesMap[dest].concat(playersInOrigin);
+        }
+    },
+
+    simulateLogic: function (dest) {
+        if (!Story.has(dest)) return;
+
+        setup.impact = true;
+        setup.simulatedPassage = dest;
+        try {
+            new Wikifier(null, Story.get(dest).text);
+        } catch (e) {
+            console.error(`Erreur logique dans ${dest}:`, e);
+        } finally {
+            delete setup.impact;
+            delete setup.simulatedPassage;
+        }
+    },
+
+    executeMove: function (playerIds, dest) {
+        playerIds.forEach(pid => {
+            const isMe = (pid === STATE.myId());
+
+            if (isMe) {
+                GAME.forceNavigate(dest);
+            } else {
+                const conn = NET.conns.find(c => c.peer === pid);
+                if (conn) {
+                    conn.send({
+                        type: MSG.GOTO,
+                        passage: dest,
+                        state: STATE.getAll()
+                    });
+                }
+            }
+        });
+    },
+
+    submitChoice: function (mode, choice) {
+        if (!GAME.DECISION_MODES[mode]) return;
+        if (STATE.isHost()) {
+            const handler = GAME.DECISION_MODES[mode].handler;
+            if (handler) handler(STATE.myId(), choice);
+        } else {
+            NET.sendToHost({ type: MSG.SUBMIT, mode: mode, choice: choice });
+        }
+    },
+};
+
+setup.p2p = { net: NET, game: GAME, ui: UI, state: STATE, user: setup.p2p.user };
+
+Config.navigation.override = function (dest) {
+    if (GAME.isSystemMove) return void (GAME.isSystemMove = false);
+
+    const origin = passage(), tagsList = tags();
+    if (dest === "Start" || tagsList.includes("pregame")) return;
+
+    const mode = tagsList.find(t => GAME.DECISION_MODES[t]) || DEFAULT_MODE;
+    if (!tagsList.includes("character")) GAME.submitChoice(mode, dest);
+    if (origin === passage()) return "WaitingPassage";
+};
+
+/**
+ * ===============================
+ * MODULE : MACROS
+ * ===============================
+ *
+ * Ce module déclare et configure toutes les macros personnalisées utilisées dans l'extension MIF-T.
+ *
+ * Macros principales :
+ *   - session : gère la création ou la connexion à une session P2P (hôte/client)
+ *   - selectChar : permet à un joueur de sélectionner un personnage
+ *   - impact : exécute un bloc de code uniquement lors de la simulation logique par l'hôte
+ *   - timer : ajoute un minuteur visuel et déclenche une navigation automatique
+ *   - characters : itère sur tous les personnages ou ceux présents dans le passage courant
+ *
+ * Ces macros facilitent l'écriture d'histoires multijoueurs en masquant la complexité technique.
+ */
+Macro.add("session", {
+    tags: null,
+    handler() {
+        $(this.output).append($("<span>")
+            .wiki(this.payload[0].contents)
+            .each((_, el) => el.addEventListener("click", () => setup.p2p.net.init(this.args[0] === "create"), true))
+        );
+    }
+});
+
+Macro.add('selectChar', {
+    tags: null,
+    handler() {
+        const charName = this.args[0];
+        $(this.output).append($("<span>")
+            .wiki(this.payload[0].contents)
+            .each((_, el) => el.addEventListener("click", () => setup.p2p?.game?.submitCharPick(charName), true))
+        );
+    }
+});
+
+Macro.add("impact", {
+    tags: null,
+    handler() {
+        if (setup.impact) {
+            new Wikifier(this.output, this.payload[0].contents);
+        }
+    }
+});
+
+Macro.add('timer', {
+    handler: function () {
+        var duration = this.args[0], dest = this.args[1];
+        if (!duration || !dest) return this.error("<<timer [secondes] [passage]>>");
+
+        var $wrapper = $('<div class="timer"><div class="timer-fill"></div></div>');
+        $wrapper.appendTo(this.output);
+        $wrapper.find('.timer-fill').css('animation-duration', duration + 's');
+
+        setTimeout(function () {
+            if (document.body.contains($wrapper[0])) Engine.play(dest);
+        }, duration * 1000);
+    }
+});
+
+Macro.add('characters', {
+    tags: null,
+    handler() {
+        const aliasShort  = "_c";
+        const aliasMedium = "_char";
+        const aliasLong   = "_character";
+        
+        let code;
+
+        const setupAliases = `
+            <<set ${aliasShort} to _item>>
+            <<set ${aliasMedium} to _item>>
+            <<set ${aliasLong} to _item>>
+        `;
+
+        if (this.args.includes("here")) {
+            code = `
+                <<for _item range $characters>>
+                    <<if _item.location is setup.simulatedPassage>>
+                        ${setupAliases}
+                        ${this.payload[0].contents}
+                    <</if>>
+                <</for>>
+            `;
+        } else {
+            code = `
+                <<for _item range $characters>>
+                    ${setupAliases}
+                    ${this.payload[0].contents}
+                <</for>>
+            `;
+        }
+
+        new Wikifier(this.output, code);
+    }
+});
+
+/**
+ * ===============================
+ * MODULE : EVENTS
+ * ===============================
+ *
+ * Ce module gère les événements du cycle de vie Twine/SugarCube.
+ *
+ * Principaux événements :
+ *   - :passagestart : met à jour les variables temporaires (_myCharacter, _isHost) à chaque début de passage
+ *   - :passagedisplay : applique les effets visuels spécifiques (ex : désactivation des liens pour les non-leaders)
+ *
+ * Ces hooks assurent la cohérence de l'interface et des variables lors de la navigation entre les passages.
+ */
+
+$(document).on(':passagestart', function (ev) {
+    State.temporary.myCharacter = setup.p2p.state.getCharacter(setup.p2p.state.getMyCharName());
+    State.temporary.isHost = setup.p2p.user.isHost;
+});
+
+$(document).on(':passagedisplay', function (ev) {
+    if (tags().includes("leader")) {
+        var leader = STATE.getLeaderForPassage(passage());
+        var me = setup.p2p.state.getMyCharName();
+        setup.p2p.ui.applyLeaderVisuals(leader, me);
+    }
+});
+
+:: StoryInit [configuration]
+<<set $characters to [
+    { name: "Joueur 1", pv: 1 },
+    { name: "Joueur 2", pv: 1 },
+    { name: "Joueur 3", pv: 1 },
+    { name: "Joueur 4", pv: 1 }
+]>>
+
+:: PassageHeader [configuration]
+<<nobr>>
+    <<if tags().includes("majority")>>
+        <div class="decision-info"><b>MODE MAJORITY</b><br>Décision démocratique : la majorité l'emporte.</div>
+
+    <<elseif tags().includes("individual")>>
+        <div class="decision-info"><b>CHOIX INDIVIDUEL</b><br>Choisissez votre propre route. Le groupe se sépare inévitablement</div>
+
+    <<elseif tags().includes("leader")>>
+        <<set _leaderName to $leaders[passage()]>>
+        <div class="decision-info"><b>MODE LEADER</b><br>Seul ''_leaderName'' a le pouvoir de décider pour le groupe.</div>
+
+    <<elseif tags().includes("exclusive")>>
+        <div class="decision-info"><b>CHOIX EXCLUSIF</b><br>Premier arrivé, premier servi.</div>
+    <</if>>
+<</nobr>>
+
+:: PassageFooter [configuration]
+<div style="font-size:0.85em; color:#888; text-align:center; margin-top:2em;">
+    &copy; 2026 Edoardo Nasuto. Tous droits réservés. Cette histoire interactive a été réalisée avec l'extension MIF-T pour Twine.
+</div>
+
+:: StoryCaption [configuration]
+<<if _myCharacter>> Personnage : ''_myCharacter.name'' <</if>>
+
+:: WaitingPassage [configuration]
+<div class="waiting-screen">
+  <h1>EN ATTENTE DES AUTRES JOUEURS...</h1>
+  <p>La suite de l'histoire se chargera une fois que tout le monde aura pris une décision.</p>
+</div>
+
+:: Start [pregame]
+! Multiplayer Interactive Fiction | Twine Extension (MIF-T)
+Bienvenue dans la démo technique de ''MIF-T'', l’extension qui transforme Twine en outil de création de fictions interactives multijoueurs.
+Cette histoire n'est pas une œuvre narrative, mais un ''tutoriel interactif''. Elle nécessite plusieurs instances (onglets) pour être comprise.
+!!! 1. Configuration de la partie
+''CRÉER UNE PARTIE (Hôte)''
+Cliquez ci-dessous pour initialiser la session.
+<<session "create">> [[CRÉER UNE NOUVELLE SESSION|Lobby]] <</session>>
+
+''REJOINDRE UNE PARTIE (Client)''
+Si un hôte a déjà créé une partie, entrez son ID ci-dessous.
+ID de l'hôte : <<textbox "$targetHostId" "">>
+<<session "join">> [[REJOINDRE LA SESSION|Lobby]] <</session>>
+!!! 2. Instructions de test (Important)
+Pour observer le fonctionnement multijoueur seul sur votre machine :
+1.  ''Dupliquez'' cette page dans ''4 onglets'' différents de votre navigateur.
+2.  Dans le ''1er onglet'', créez la partie (Hôte).
+3.  Dans les ''3 autres onglets'', collez l'ID de l'hôte et rejoignez la partie (Clients).
+4.  Revenez sur l'onglet de l'hôte pour lancer l'aventure une fois tout le monde connecté.
+
+:: Lobby [pregame]
+! Lobby
+Statut : <<print _isHost ? "''HÔTE''" : "''CLIENT''">>
+<<if _isHost>> ''ID DE LA PARTIE À PARTAGER :'' <<print setup.p2p.user.id>>
+    <<button "COPIER L'ID">>
+        <<run navigator.clipboard.writeText(setup.p2p.user.id)>>
+    <</button>>
+<<else>>
+    Connecté au lobby de : $targetHostId
+<</if>>
+''Joueurs connectés :'' <<print Object.keys($players).length>>
+<<if _isHost>>
+    [[LANCER LA SÉLECTION DES RÔLES|CharactersChoice][setup.p2p.net.broadcast({ type: 'GOTO', passage: 'CharactersChoice' })]]
+<<else>>
+    //En attente que l'hôte démarre la partie...//
+<</if>>
+----
+
+!!! Comprendre la technologie : Le Peer-to-Peer (P2P)
+Vous êtes actuellement dans le lobby. C’est ici que la magie de la connexion s’opère via ''PeerJS'' et ''WebRTC''.
+* ''Pas de serveur central :'' Contrairement aux jeux classiques, ici il n'y a pas de gros serveur payant. Les données transitent directement d'un navigateur à l'autre.
+* ''L'Hôte est le maître du jeu :'' C'est lui qui détient la "vérité" de l'histoire (variables globales). Il valide les actions et synchronise tout le monde.
+* ''Les Clients :'' Ils envoient leurs choix à l'hôte et reçoivent en retour le nouveau passage à afficher.
+
+:: CharactersChoice [character]
+! Sélection du Personnage
+Veuillez choisir votre identité pour cette aventure.
+//Note : Premier arrivé, premier servi. Dès qu'un personnage est sélectionné, il disparaît pour les autres.//
+
+<<for _c range $characters>>
+    <<nobr>> <<capture _c>> <<selectChar _c.name>>
+        [[_c.name|Introduction]]
+    <</selectChar>> <</capture>> <</nobr>>
+<</for>>
+----
+
+!!! Comment ça marche ?
+Ce passage utilise le tag spécial {{{character}}}.
+L'extension gère nativement l'exclusion mutuelle : vous n'avez pas besoin de coder la logique "si pris alors cacher".
+
+Tout se définit dans {{{StoryInit}}} via la variable {{{$characters}}}. Une fois que le dernier joueur a choisi, la transition vers le passage suivant est ''automatique''.
+
+:: Introduction
+! Introduction
+Vous incarnez : ''_myCharacter.name''
+
+[[Comprendre les modes de décision (Théorie)|Décisions]]
+[[Passer directement à la pratique|Individual]]
+----
+
+!!! Le concept de "Tour par tour Simultané"
+Avez-vous remarqué l'attente après votre sélection de personnage ?
+C'est la philosophie centrale de MIF-T : la ''Synchronisation Narrative''.
+
+1.  ''Lecture :'' Tout le monde lit le passage courant.
+2.  ''Choix :'' Chacun fait son choix (parfois différent).
+3.  ''Attente :'' Le jeu se met en pause ("Waiting Screen") tant que le dernier joueur n'a pas joué.
+4.  ''Résolution :'' L'hôte calcule les conséquences pour tout le monde en une fraction de seconde et déplace le groupe.
+
+Cela permet à l'auteur de maîtriser le ''rythme''. Personne ne peut "rusher" l'histoire et spoiler la fin aux autres.
+
+:: Décisions
+! Les 4 Modes de Décision
+Dans MIF-T, la manière dont les joueurs interagissent avec l'histoire change selon le ''Tag'' que vous ajoutez au passage.
+!! 1. Décision Collective (Tag: {{{majority}}})
+Le mode démocratique. Le groupe doit voter.
+* Si 3 joueurs votent "Gauche" et 1 vote "Droite", tout le monde part à Gauche.
+* //Idéal pour : Les embranchements majeurs du scénario.//
+!! 2. Décision Leader (Tag: {{{leader}}})
+Le mode autoritaire.
+* Un joueur spécifique est désigné (via une variable). Lui seul voit les liens cliquables.
+* Les autres voient le texte mais doivent attendre la décision du chef.
+* //Idéal pour : Les situations hiérarchiques ou lorsqu'un joueur possède un objet clé.//
+!! 3. Décision Individuelle (Tag: {{{individual}}})
+Le mode parallèle. C'est le mode par défaut.
+* Chacun vit sa vie. Le joueur A peut aller en cuisine, le joueur B au jardin.
+* Ils se retrouveront plus tard quand l'auteur décidera de faire converger les branches.
+* //Idéal pour : Les phases d'enquête ou d'exploration séparée.//
+!! 4. Décision Exclusive (Tag: {{{exclusive}}})
+Le mode compétitif "Premier arrivé, premier servi".
+* Les choix sont uniques. Si je prends l'épée, le lien disparaît pour vous.
+* //Idéal pour : La répartition de butin ou l'attribution de tâches urgentes.//
+
+[[Comprendre les Variables et la Synchro|Variables]]
+
+:: Variables
+! Architecture des Données
+En multijoueur, la gestion des variables ({{{$or}}}, {{{$pv}}}) est délicate. Si tout le monde modifie les variables en même temps, c'est le chaos.
+!! La règle d'or : L'Hôte calcule tout
+Pour garantir la cohérence, seul l'hôte exécute les modifications de variables. Nous utilisons la macro {{{<<impact>>}}}.
+{{{
+<<impact>>
+    <<set $tresorCommun += 100>>
+<</impact>>
+}}}
+Tout ce qui est entre ces balises n'est exécuté ''qu'une seule fois'' par l'hôte au moment de la résolution du tour, avant d'envoyer le résultat aux clients.
+!! La macro {{{<<characters>>}}}
+Comment modifier les PV de ''tous'' les joueurs présents dans un passage ?
+Utilisez la boucle {{{characters}}} avec l'argument {{{here}}}.
+{{{
+<<impact>>
+    <<characters here>>
+        <<set _char.pv -= 5>>  /* Enlève 5 PV à tous ceux présents ici */
+    <</characters>>
+<</impact>>
+}}}
+* {{{_character}}} {{{_char}}} (ou {{{_c}}}) : Variables temporaire représentant le personnage dans la boucle.
+* {{{_myCharacter}}} : Variable locale représentant le personnage du joueur qui regarde l'écran.
+
+[[Passer à la pratique : Mode Individuel|Individual]]
+
+:: Individual [individual]
+! Le Mode Individuel
+Vous êtes dans un passage {{{individual}}}.
+Ici, votre choix n'engage que vous. Le groupe va inévitablement se scinder.
+
+''Action requise :''
+Sur vos différents onglets, essayez de répartir le groupe :
+* Avec 2 joueurs, cliquez sur ''Flux A''.
+* Avec les 2 autres, cliquez sur ''Flux B''.
+
+[[Choisir le Flux A (Bonus de soin)|Indiv_A]]
+[[Choisir le Flux B (Information secrète)|Indiv_B]]
+
+//Observez bien : tant que le dernier onglet n'a pas cliqué, personne ne bouge. C'est la barrière de synchronisation.//
+
+:: Indiv_A
+<<impact>>
+    <<characters here>>
+        <<set _char.pv += 10>>
+    <</characters>>
+<</impact>>
+! Branche A : La Soirée Mousse
+Vous avez choisi la branche A. Regardez vos autres onglets : ceux qui ont choisi B ne voient pas ce texte ! Ils sont dans un autre passage.
+!!! Modification de variable
+Nous avons utilisé ce code pour vous soigner uniquement vous (les joueurs présents dans ce passage) :
+{{{
+<<impact>>
+    <<characters here>>
+        <<set _char.pv += 10>>
+    <</characters>>
+<</impact>>
+}}}
+''Vos PV actuels :'' _myCharacter.pv
+
+[[Rejoindre le groupe (Convergence)|Majority]]
+
+:: Indiv_B
+! Branche B : Les Archives Secrètes
+Vous avez choisi la branche B.
+C'est ici que vous pouvez donner une information confidentielle ou des objets spécifique à une partie du groupe seulement. Les joueurs du groupe A ne sauront jamais ce que vous lisez ici.
+
+''Vos PV actuels :'' _myCharacter.pv (inchangés car pas de bonus ici).
+
+[[Rejoindre le groupe (Convergence)|Majority]]
+
+:: Majority [majority]
+! Le Mode Majorité
+Tous les joueurs ont convergé ici, peu importe d'où ils venaient.
+Le passage porte le tag {{{majority}}}.
+
+''Action requise :''
+Essayez de créer une majorité (3 votes contre 1, ou 4 contre 0).
+Le système comptera les voix une fois que tout le monde aura voté.
+
+[[Voter pour l'Option A|Majority_A]]
+[[Voter pour l'Option B|Majority_B]]
+!!! En cas d'égalité ?
+Si le vote est de 2 contre 2, le système MIF-T effectue un choix ''aléatoire'' parmi les options à égalité pour débloquer la situation.
+
+:: Majority_A
+! Résultat : L'Option A l'emporte
+La majorité a décidé.
+Notez que même les joueurs qui avaient voté "B" ont été forcés de venir ici.
+
+[[Continuer vers le Mode Leader|Leader]]
+
+:: Majority_B
+! Résultat : L'Option B l'emporte
+La majorité a décidé.
+Notez que même les joueurs qui avaient voté "A" ont été forcés de venir ici.
+
+[[Continuer vers le Mode Leader|Leader]]
+
+:: Leader [leader]
+<<impact>> <<set $leaders["Leader"] to "Joueur 1">> <</impact>>
+! Le Mode Leader
+Dans ce passage, nous avons défini un chef via le code :
+{{{<<set $leaders["Leader"] to "Joueur 1">>}}}
+(Note : "Leader" est le nom de ce passage).
+* ''Si vous êtes Joueur 1 :'' Vous avez les commandes.
+* ''Si vous êtes Joueur 2, 3 ou 4 :'' Vous ne voyez aucun lien. Vous attendez le chef.
+
+[[Le Leader décide : GAUCHE|Leader_Gauche]]
+[[Le Leader décide : DROITE|Leader_Droite]]
+
+:: Leader_Gauche
+! Le groupe part à GAUCHE
+Le leader a tranché. Peu importe votre avis personnel, le groupe entier suit le mouvement.
+
+[[Découvrir le Mode Exclusif|Exclusive]]
+
+:: Leader_Droite
+! Le groupe part à DROITE
+Le leader a tranché. Peu importe votre avis personnel, le groupe entier suit le mouvement.
+
+[[Découvrir le Mode Exclusif|Exclusive]]
+
+:: Exclusive [exclusive]
+<<timer 50 "Fin">>
+! Le Mode Exclusif (Compétition)
+Attention ! Ce mode est tagué {{{exclusive}}}.
+Chaque lien ci-dessous ne peut être cliqué que par ''une seule personne''.
+
+De plus, grâce à la macro {{timer}} native à l'extension, un minuteur tourne !
+{{{
+<<timer 50 "Fin">>
+}}}
+//Si vous ne choisissez pas dans 50 secondes, vous serez envoyé au passage "Fin".//
+
+''Choisissez vite !''
+
+[[Prendre l'Objet A (Simple)|Exclusive_A]]
+[[Prendre l'Objet B (Isolé)|Exclusive_B]]
+[[Prendre l'Objet C (Donne le Leadership)|Exclusive_C]]
+[[Ne rien faire (Rester en retrait)|Exclusive_R]]
+
+:: Exclusive_A
+! Vous avez l'Objet A
+Bravo, vous avez été le plus rapide sur ce clic.
+Vous êtes maintenant seul dans ce passage en attendant que les autres fassent leur choix.
+
+[[Aller au point de rendez-vous|Vote_AB]]
+
+:: Exclusive_B
+! Vous avez l'Objet B
+Objet sécurisé.
+Notez la fluidité : l'interface se met à jour en temps réel pour griser les choix pris par les autres sur leurs écrans.
+
+[[Aller au point de rendez-vous|Vote_AB]]
+
+:: Exclusive_C
+<<impact>>
+    <<set _find to true>>
+    <<characters here>>
+        <<if _find>>
+            <<set $leaders["Leader_CR"] to _c.name>>
+            <<set _find to false>>
+        <</if>>
+    <</characters>>
+<</impact>>
+! Vous avez l'Objet C
+En prenant cet objet, nous avons exécuté un script qui vous donne le droit de décider dans la prochaine salle.
+
+Code exécuté :
+{{{
+<<impact>>
+    <<set _find to true>>
+    <<characters here>>
+        <<if _find>>
+            <<set $leaders["Leader_CR"] to _c.name>>
+            <<set _find to false>>
+        <</if>>
+    <</characters>>
+<</impact>>
+}}}
+
+[[Rejoindre un autre joueur|Leader_CR]]
+
+:: Exclusive_R
+! Vous n'avez rien pris
+Soit vous avez été trop lent, soit vous êtes pacifiste.
+Vous vous retrouvez avec le joueur qui a pris l'Objet C. Espérons qu'il soit clément, car c'est lui qui va décider pour vous au prochain tour.
+
+[[Rejoindre le porteur de l'Objet C|Leader_CR]]
+
+:: Vote_AB [majority]
+! Groupe AB : Vote Restreint
+Ici se trouvent uniquement les joueurs A et B.
+Vous êtes dans une "bulle" séparée des autre joueurs.
+Vous devez prendre une décision majoritaire entre vous deux.
+
+[[Chemin 1|Vote_1]]
+[[Chemin 2|Vote_2]]
+
+:: Leader_CR [leader]
+! Groupe CR : La Dictature de C
+Ici se trouvent le joueur C et le joueur R (rien).
+Comme le joueur C a ramassé l'objet précédemment, c'est lui qui décide pour ce binôme.
+
+Le joueur R doit subir le choix.
+
+[[Chemin 1|Leader_1]]
+[[Chemin 2|Leader_2]]
+
+:: Vote_1
+! Résultat du Groupe AB : Chemin 1
+Vous avez terminé votre embranchement.
+Cela prouve que l'on peut gérer des sous-groupes indépendants dans la même histoire.
+[[TERMINER LA DÉMO|Fin]]
+
+:: Vote_2
+! Résultat du Groupe AB : Chemin 2
+Vous avez terminé votre embranchement.
+Cela prouve que l'on peut gérer des sous-groupes indépendants dans la même histoire.
+[[TERMINER LA DÉMO|Fin]]
+
+:: Leader_1
+! Résultat du Groupe CR : Chemin 1
+Le Leader C a décidé du destin du groupe.
+[[TERMINER LA DÉMO|Fin]]
+
+:: Leader_2
+! Résultat du Groupe CR : Chemin 2
+Le Leader C a décidé du destin du groupe.
+[[TERMINER LA DÉMO|Fin]]
+
+:: Fin
+! Fin de la Démo Technique
+Félicitations ! Vous avez expérimenté les mécaniques fondamentales de ''MIF-T''.
+!!! Récapitulatif
+1.  ''Character'' : Assignation unique de rôle au départ.
+2.  ''Majority'' : Vote démocratique pour déplacer tout le groupe.
+3.  ''Leader'' : Variable dynamique permettant à un seul joueur de guider le groupe.
+4.  ''Exclusive'' : Gestion de la rareté et de la rapidité (ressources limitées).
+5.  ''Individual'' : Séparation des joueurs dans des passages distincts (parallélisme).
+
+Vous pouvez maintenant utiliser ces briques pour construire des récits complexes : Enquêtes en équipes séparées, gestion de crise, jeux de rôle, escape games narratifs...
+
+//Merci d'avoir testé l'extension !//

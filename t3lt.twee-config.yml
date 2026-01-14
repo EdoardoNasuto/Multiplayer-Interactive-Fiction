@@ -1,0 +1,16 @@
+sugarcube-2:
+  macros:
+    session:
+      name: session
+      container: true
+    selectChar:
+      name: selectChar
+      container: true
+    impact:
+      name: impact
+      container: true
+    characters:
+      name: characters
+      container: true
+    timer:
+      name: timer
