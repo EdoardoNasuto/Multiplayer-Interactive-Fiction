@@ -10,6 +10,7 @@ Multiplayer Interactive Fiction | Twine Extension (MIF-T)
     "tag-colors": {
         "configuration": "yellow",
         "character": "orange",
+        "death":"yellow",
         "exclusive": "red",
         "individual": "green",
         "leader": "purple",
@@ -442,7 +443,12 @@ const GAME = {
                     STATE.setPendingMove(passageName, winner);
                 }
             }
-        }
+        },
+        death: {
+            handler: (playerId, choice) => {},
+            ready: (players) => true,
+            resolve: (players, passageName) => {}
+        },
     },
 
     isSystemMove: false,
@@ -612,6 +618,14 @@ const GAME = {
         playerIds.forEach(pid => {
             const isMe = (pid === STATE.myId());
 
+            const charName = STATE.getPlayer(pid)?.char;
+            const charObj = STATE.getCharacter(charName);
+            
+            if (charObj.pv <= 0) {
+                dest = "DeathPassage";
+                charObj.location = "DeathPassage";
+            }
+
             if (isMe) {
                 GAME.forceNavigate(dest);
             } else {
@@ -739,13 +753,63 @@ Macro.add('characters', {
         } else {
             code = `
                 <<for _item range $characters>>
-                    ${setupAliases}
-                    ${this.payload[0].contents}
+                    <<if _item.taken>>
+                        ${setupAliases}
+                        ${this.payload[0].contents}
+                    <</if>>
                 <</for>>
             `;
         }
 
         new Wikifier(this.output, code);
+    }
+});
+
+Macro.add('leader', {
+    handler() {
+        if (!setup.impact) return;
+        var passageName = this.args[1] || setup.simulatedPassage;
+        var leaderName = this.args[0];
+        if (passageName && leaderName) {
+            State.variables.leaders[passageName] = leaderName;
+        }
+    }
+});
+
+Macro.add('renameCharacters', {
+    handler() {
+        const STATE = setup.p2p.state;
+        if (!STATE.isHost()) return;
+
+        let html = ``;
+        STATE.getCharacters().forEach(c => {
+            html += `<div style="margin-bottom:8px;">
+                <span style="display:inline-block; width:120px;">${c.name} :</span>
+                <input type="text" class="rename-input" data-old="${c.name}" value="${c.name}">
+            </div>`;
+        });
+
+        const $panel = $(html).on('change', '.rename-input', function() {
+            const oldName = this.dataset.old;
+            const newName = this.value.trim();
+
+            if (!newName || newName === oldName) return;
+
+            if (STATE.getCharacter(newName)) {
+                this.value = oldName;
+                return alert("Ce nom est déjà pris.");
+            }
+
+            STATE.getCharacter(oldName).name = newName;
+            Object.values(STATE.getPlayers()).forEach(p => { 
+                if (p.char === oldName) p.char = newName; 
+            });
+
+            this.dataset.old = newName;
+            setup.p2p.net.broadcastState();
+        });
+
+        $(this.output).append($panel);
     }
 });
 
@@ -815,6 +879,12 @@ $(document).on(':passagedisplay', function (ev) {
   <p>La suite de l'histoire se chargera une fois que tout le monde aura pris une décision.</p>
 </div>
 
+:: DeathPassage [death]
+<div class="waiting-screen">
+  <h1>TU ES MORT</h1>
+  <p>La suite de l'histoire s'écrira sans toi</p>
+</div>
+
 :: Start [pregame]
 ! Multiplayer Interactive Fiction | Twine Extension (MIF-T)
 Bienvenue dans la démo technique de ''MIF-T'', l’extension qui transforme Twine en outil de création de fictions interactives multijoueurs.
@@ -845,7 +915,7 @@ Statut : <<print _isHost ? "''HÔTE''" : "''CLIENT''">>
 <<else>>
     Connecté au lobby de : $targetHostId
 <</if>>
-''Joueurs connectés :'' <<print Object.keys($players).length>>
+''Joueurs connectés :'' <span id="player-count"><<print Object.keys($players).length>></span>
 <<if _isHost>>
     [[LANCER LA SÉLECTION DES RÔLES|CharactersChoice][setup.p2p.net.broadcast({ type: 'GOTO', passage: 'CharactersChoice' })]]
 <<else>>
@@ -1020,11 +1090,19 @@ Notez que même les joueurs qui avaient voté "A" ont été forcés de venir ici
 [[Continuer vers le Mode Leader|Leader]]
 
 :: Leader [leader]
-<<impact>> <<set $leaders["Leader"] to "Joueur 1">> <</impact>>
+<<impact>> <<leader "Joueur 1">> <</impact>>
 ! Le Mode Leader
-Dans ce passage, nous avons défini un chef via le code :
-{{{<<set $leaders["Leader"] to "Joueur 1">>}}}
-(Note : "Leader" est le nom de ce passage).
+Dans ce passage, nous avons défini un chef via la macro :
+{{{<<leader "Joueur 1">>}}}
+
+!!! Macro {{leader}}
+La macro {{leader}} permet de définir dynamiquement le leader d'un passage lors de la résolution logique (dans un bloc {{impact}}).
+
+* **Syntaxe simple** : {{leader "NomDuPerso"}} — définit le leader pour le passage courant (celui simulé).
+* **Syntaxe avancée** : {{leader "NomDuPerso" "NomDuPassage"}} — définit le leader pour un passage spécifique.
+* À utiliser dans un bloc {{impact}} pour garantir que seul l'hôte applique la modification.
+* Peut être utilisée dans une boucle {{characters here}} pour désigner dynamiquement un leader selon une condition (voir exemple dans le mode exclusif).
+
 * ''Si vous êtes Joueur 1 :'' Vous avez les commandes.
 * ''Si vous êtes Joueur 2, 3 ou 4 :'' Vous ne voyez aucun lien. Vous attendez le chef.
 
@@ -1081,7 +1159,7 @@ Notez la fluidité : l'interface se met à jour en temps réel pour griser les c
     <<set _find to true>>
     <<characters here>>
         <<if _find>>
-            <<set $leaders["Leader_CR"] to _c.name>>
+            <<leader _c.name "Leader_CR">>
             <<set _find to false>>
         <</if>>
     <</characters>>
@@ -1095,7 +1173,7 @@ Code exécuté :
     <<set _find to true>>
     <<characters here>>
         <<if _find>>
-            <<set $leaders["Leader_CR"] to _c.name>>
+            <<leader _c.name "Leader_CR">>
             <<set _find to false>>
         <</if>>
     <</characters>>
