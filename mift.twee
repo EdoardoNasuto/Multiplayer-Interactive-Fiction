@@ -126,8 +126,9 @@ const STATE = {
     getPlayers: () => STATE.v.players,
     getPlayer: (id) => STATE.v.players[id],
     addPlayer: (id) => STATE.v.players[id] ??= { char: null },
-    setPlayerChar: (id, charName) => { if (STATE.v.players[id]) STATE.v.players[id].char = charName; },
-    getMyCharName: () => STATE.v.players[setup.p2p.user.id]?.char ?? null,
+    setPlayerChar: (id, charId) => { if (STATE.v.players[id]) STATE.v.players[id].char = charId; },
+    getMyChar: () => STATE.getCharacter(STATE.v.players[setup.p2p.user.id]?.char),
+    getMyCharName: () => STATE.getMyChar()?.name ?? null,
 
     // --- Target Host ---
     getTargetHostId: () => STATE.v.targetHostId,
@@ -135,7 +136,7 @@ const STATE = {
 
     // --- Characters ---
     getCharacters: () => STATE.v.characters,
-    getCharacter: (name) => STATE.v.characters?.find(c => c.name === name),
+    getCharacter: (id) => STATE.v.characters?.find(c => c.id === id),
 
     // --- Generic Choices Management ---
     getChoices: (mode) => STATE.v.choices[mode] ?? {},
@@ -200,8 +201,8 @@ const UI = {
         });
     },
 
-    applyLeaderVisuals: function (leaderName, myCharName) {
-        if (myCharName !== leaderName) {
+    applyLeaderVisuals: function (leaderId, myCharId) {
+        if (myCharId !== leaderId) {
             $(".link-internal").addClass("link-disabled");
         }
     },
@@ -304,7 +305,7 @@ const NET = {
             }
             GAME.forceNavigate(data.passage);
         },
-        [MSG.PICK_CHAR]: (data, sender) => GAME.handleCharPick(sender, data.charName),
+        [MSG.PICK_CHAR]: (data, sender) => GAME.handleCharPick(sender, data.charId),
 
         [MSG.SUBMIT]: (data, sender) => {
             if (!STATE.isHost()) return;
@@ -458,17 +459,17 @@ const GAME = {
         Engine.play(passage);
     },
 
-    submitCharPick: function (charName) {
-        if (STATE.isHost()) GAME.handleCharPick(STATE.myId(), charName);
-        else NET.sendToHost({ type: MSG.PICK_CHAR, charName: charName });
+    submitCharPick: function (charId) {
+        if (STATE.isHost()) GAME.handleCharPick(STATE.myId(), charId);
+        else NET.sendToHost({ type: MSG.PICK_CHAR, charId: charId });
     },
 
-    handleCharPick: function (playerId, charName) {
-        const charObj = STATE.getCharacter(charName);
+    handleCharPick: function (playerId, charId) {
+        const charObj = STATE.getCharacter(charId);
         if (!charObj || charObj.taken) return;
 
         charObj.taken = true;
-        STATE.setPlayerChar(playerId, charName);
+        STATE.setPlayerChar(playerId, charId);
 
         NET.broadcastState();
         if (STATE.isHost()) UI.lockTakenCharacters(STATE.getCharacters());
@@ -694,10 +695,10 @@ Macro.add("session", {
 Macro.add('selectChar', {
     tags: null,
     handler() {
-        const charName = this.args[0];
+        const charId = this.args[0];
         $(this.output).append($("<span>")
             .wiki(this.payload[0].contents)
-            .each((_, el) => el.addEventListener("click", () => setup.p2p?.game?.submitCharPick(charName), true))
+            .each((_, el) => el.addEventListener("click", () => setup.p2p?.game?.submitCharPick(charId), true))
         );
     }
 });
@@ -769,9 +770,9 @@ Macro.add('leader', {
     handler() {
         if (!setup.impact) return;
         var passageName = this.args[1] || setup.simulatedPassage;
-        var leaderName = this.args[0];
-        if (passageName && leaderName) {
-            State.variables.leaders[passageName] = leaderName;
+        var leaderId = this.args[0];
+        if (passageName && leaderId) {
+            State.variables.leaders[passageName] = leaderId;
         }
     }
 });
@@ -785,25 +786,25 @@ Macro.add('renameCharacters', {
         STATE.getCharacters().forEach(c => {
             html += `<div style="margin-bottom:8px;">
                 <span style="display:inline-block; width:120px;">${c.name} :</span>
-                <input type="text" class="rename-input" data-old="${c.name}" value="${c.name}">
+                <input type="text" class="rename-input" data-id="${c.id}" data-old="${c.name}" value="${c.name}">
             </div>`;
         });
 
         const $panel = $(html).on('change', '.rename-input', function() {
+            const id = this.dataset.id;
             const oldName = this.dataset.old;
             const newName = this.value.trim();
 
             if (!newName || newName === oldName) return;
 
-            if (STATE.getCharacter(newName)) {
+            if (STATE.getCharacters().some(ch => ch.name === newName)) {
                 this.value = oldName;
                 return alert("Ce nom est déjà pris.");
             }
 
-            STATE.getCharacter(oldName).name = newName;
-            Object.values(STATE.getPlayers()).forEach(p => { 
-                if (p.char === oldName) p.char = newName; 
-            });
+            const char = STATE.getCharacter(id);
+            if (!char) return;
+            char.name = newName;
 
             this.dataset.old = newName;
             setup.p2p.net.broadcastState();
@@ -828,24 +829,24 @@ Macro.add('renameCharacters', {
  */
 
 $(document).on(':passagestart', function (ev) {
-    State.temporary.myCharacter = setup.p2p.state.getCharacter(setup.p2p.state.getMyCharName());
+    State.temporary.myCharacter = setup.p2p.state.getMyChar();
     State.temporary.isHost = setup.p2p.user.isHost;
 });
 
 $(document).on(':passagedisplay', function (ev) {
     if (tags().includes("leader")) {
-        var leader = STATE.getLeaderForPassage(passage());
-        var me = setup.p2p.state.getMyCharName();
-        setup.p2p.ui.applyLeaderVisuals(leader, me);
+        var leaderId = STATE.getLeaderForPassage(passage());
+        var meId = setup.p2p.state.getMyChar()?.id;
+        setup.p2p.ui.applyLeaderVisuals(leaderId, meId);
     }
 });
 
 :: StoryInit [configuration]
 <<set $characters to [
-    { name: "Joueur 1", pv: 1 },
-    { name: "Joueur 2", pv: 1 },
-    { name: "Joueur 3", pv: 1 },
-    { name: "Joueur 4", pv: 1 }
+    { id: "c1", name: "Joueur 1", pv: 1 },
+    { id: "c2", name: "Joueur 2", pv: 1 },
+    { id: "c3", name: "Joueur 3", pv: 1 },
+    { id: "c4", name: "Joueur 4", pv: 1 }
 ]>>
 
 :: PassageHeader [configuration]
@@ -857,7 +858,8 @@ $(document).on(':passagedisplay', function (ev) {
         <div class="decision-info"><b>CHOIX INDIVIDUEL</b><br>Choisissez votre propre route. Le groupe se sépare inévitablement</div>
 
     <<elseif tags().includes("leader")>>
-        <<set _leaderName to $leaders[passage()]>>
+        <<set _leaderId to $leaders[passage()]>>
+        <<set _leaderName to (setup.p2p.state.getCharacter(_leaderId)?.name ?? _leaderId)>>
         <div class="decision-info"><b>MODE LEADER</b><br>Seul ''_leaderName'' a le pouvoir de décider pour le groupe.</div>
 
     <<elseif tags().includes("exclusive")>>
@@ -935,10 +937,11 @@ Veuillez choisir votre identité pour cette aventure.
 //Note : Premier arrivé, premier servi. Dès qu'un personnage est sélectionné, il disparaît pour les autres.//
 
 <<for _c range $characters>>
-    <<nobr>> <<capture _c>> <<selectChar _c.name>>
+    <<nobr>> <<capture _c>> <<selectChar _c.id>>
         [[_c.name|Introduction]]
     <</selectChar>> <</capture>> <</nobr>>
 <</for>>
+<<renameCharacters>>
 ----
 
 !!! Comment ça marche ?
@@ -947,7 +950,13 @@ L'extension gère nativement l'exclusion mutuelle : vous n'avez pas besoin de co
 
 Tout se définit dans {{{StoryInit}}} via la variable {{{$characters}}}. Une fois que le dernier joueur a choisi, la transition vers le passage suivant est ''automatique''.
 
-:: Introduction
+!!! Renommer les personnages (optionnel)
+Si vous le souhaitez, l'hôte peut renommer les personnages avant le début de la partie.
+
+- **Important** : Seul l'hôte peut effectuer ces renommages. Les clients ne verront pas les champs de saisie.
+- **Désactiver** : Si vous ne souhaitez pas permettre le renommage, supprimez simplement la macro du passage 'renameCharacters'
+
+:: Introduction [majority]
 ! Introduction
 Vous incarnez : ''_myCharacter.name''
 
@@ -1090,16 +1099,16 @@ Notez que même les joueurs qui avaient voté "A" ont été forcés de venir ici
 [[Continuer vers le Mode Leader|Leader]]
 
 :: Leader [leader]
-<<impact>> <<leader "Joueur 1">> <</impact>>
+<<impact>> <<leader "c1">> <</impact>>
 ! Le Mode Leader
 Dans ce passage, nous avons défini un chef via la macro :
-{{{<<leader "Joueur 1">>}}}
+{{{<<leader "c1">>}}}
 
 !!! Macro {{leader}}
 La macro {{leader}} permet de définir dynamiquement le leader d'un passage lors de la résolution logique (dans un bloc {{impact}}).
 
-* **Syntaxe simple** : {{leader "NomDuPerso"}} — définit le leader pour le passage courant (celui simulé).
-* **Syntaxe avancée** : {{leader "NomDuPerso" "NomDuPassage"}} — définit le leader pour un passage spécifique.
+* **Syntaxe simple** : {{leader "idDuPerso"}} — définit le leader pour le passage courant (utiliser l'`id`).
+* **Syntaxe avancée** : {{leader "idDuPerso" "NomDuPassage"}} — définit le leader pour un passage spécifique.
 * À utiliser dans un bloc {{impact}} pour garantir que seul l'hôte applique la modification.
 * Peut être utilisée dans une boucle {{characters here}} pour désigner dynamiquement un leader selon une condition (voir exemple dans le mode exclusif).
 
@@ -1159,7 +1168,7 @@ Notez la fluidité : l'interface se met à jour en temps réel pour griser les c
     <<set _find to true>>
     <<characters here>>
         <<if _find>>
-            <<leader _c.name "Leader_CR">>
+            <<leader _c.id "Leader_CR">>
             <<set _find to false>>
         <</if>>
     <</characters>>
@@ -1173,7 +1182,7 @@ Code exécuté :
     <<set _find to true>>
     <<characters here>>
         <<if _find>>
-            <<leader _c.name "Leader_CR">>
+            <<leader _c.id "Leader_CR">>
             <<set _find to false>>
         <</if>>
     <</characters>>
