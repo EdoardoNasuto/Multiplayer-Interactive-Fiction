@@ -90,7 +90,7 @@ State.variables.choices = {
 };
 
 // --- Group management variables ---
-State.variables.leaders = {};           // Map: Passage -> LeaderName
+State.variables.leaders = {};           // Map: Passage -> LeaderId
 State.variables.pendingMoves = {};      // Résultat final validé par le système avant déplacement
 
 setup.p2p = { user: { id: null, isHost: false } };
@@ -184,7 +184,8 @@ const UI = {
         if (!characters) return;
         characters.forEach(c => {
             if (c.taken) {
-                $('a.link-internal').filter((i, el) => $(el).text() === c.name).addClass('link-disabled');
+                var selector = 'span[data-char-id="' + c.id + '"]';
+                $(selector).find('a.link-internal').addClass('link-disabled');
             }
         });
     },
@@ -350,8 +351,8 @@ const GAME = {
     DECISION_MODES: {
         exclusive: {
             handler: (playerId, choice) => {
-                const charName = STATE.getPlayer(playerId)?.char;
-                const charObj = STATE.getCharacter(charName);
+                const charId = STATE.getPlayer(playerId)?.char;
+                const charObj = STATE.getCharacter(charId);
                 if (!charObj) return;
 
                 const playersInRoom = GAME.getPlayersInPassage(charObj.location);
@@ -397,8 +398,8 @@ const GAME = {
         leader: {
             handler: (playerId, choice) => {
                 STATE.setChoice('leader', playerId, choice);
-                const charName = STATE.getPlayer(playerId)?.char;
-                const c = STATE.getCharacter(charName);
+                const charId = STATE.getPlayer(playerId)?.char;
+                const c = STATE.getCharacter(charId);
                 if (c?.location) {
                     STATE.setPendingMove(c.location, choice);
                     STATE.removeChoice('leader', playerId);
@@ -412,8 +413,8 @@ const GAME = {
         },
         majority: {
             handler: (playerId, choice) => {
-                const charName = STATE.getPlayer(playerId)?.char;
-                const c = STATE.getCharacter(charName);
+                const charId = STATE.getPlayer(playerId)?.char;
+                const c = STATE.getCharacter(charId);
                 if (c?.location) {
                     STATE.setChoice('majority', playerId, choice);
                     GAME.checkPendingMoves();
@@ -495,8 +496,8 @@ const GAME = {
         const ids = [];
         const players = STATE.getPlayers();
         Object.keys(players).forEach(pid => {
-            const charName = players[pid].char;
-            const c = STATE.getCharacter(charName);
+            const charId = players[pid].char;
+            const c = STATE.getCharacter(charId);
             if (c && c.location === passage) ids.push(pid);
         });
         return ids;
@@ -570,8 +571,8 @@ const GAME = {
         destinations.forEach(dest => {
             const playerIds = movesToExecute[dest];
             playerIds.forEach(pid => {
-                const charName = STATE.getPlayer(pid)?.char;
-                const charObj = STATE.getCharacter(charName);
+                const charId = STATE.getPlayer(pid)?.char;
+                const charObj = STATE.getCharacter(charId);
                 if (charObj) charObj.location = dest;
             });
         });
@@ -619,8 +620,8 @@ const GAME = {
         playerIds.forEach(pid => {
             const isMe = (pid === STATE.myId());
 
-            const charName = STATE.getPlayer(pid)?.char;
-            const charObj = STATE.getCharacter(charName);
+            const charId = STATE.getPlayer(pid)?.char;
+            const charObj = STATE.getCharacter(charId);
             
             const deathPaths = STATE.v.deathCriteria || [];
             for (let prop of deathPaths) {
@@ -702,6 +703,7 @@ Macro.add('selectChar', {
     handler() {
         const charId = this.args[0];
         $(this.output).append($("<span>")
+            .attr('data-char-id', charId)
             .wiki(this.payload[0].contents)
             .each((_, el) => el.addEventListener("click", () => setup.p2p?.game?.submitCharPick(charId), true))
         );
@@ -1076,7 +1078,7 @@ Sur vos différents onglets, essayez de répartir le groupe :
 :: Indiv_A
 <<impact>>
     <<characters here>>
-        <<set _char.pv -= 10>>
+        <<set _char.pv += 10>>
     <</characters>>
 <</impact>>
 ! Branche A : La Soirée Mousse
@@ -1136,10 +1138,8 @@ Notez que même les joueurs qui avaient voté "A" ont été forcés de venir ici
 ! Le Mode Leader
 Dans ce passage, nous avons défini un chef via la macro :
 {{{<<leader "c1">>}}}
-
 !!! Macro {{leader}}
 La macro {{leader}} permet de définir dynamiquement le leader d'un passage lors de la résolution logique (dans un bloc {{impact}}).
-
 * **Syntaxe simple** : {{leader "idDuPerso"}} — définit le leader pour le passage courant (utiliser l'`id`).
 * **Syntaxe avancée** : {{leader "idDuPerso" "NomDuPassage"}} — définit le leader pour un passage spécifique.
 * À utiliser dans un bloc {{impact}} pour garantir que seul l'hôte applique la modification.
