@@ -622,9 +622,14 @@ const GAME = {
             const charName = STATE.getPlayer(pid)?.char;
             const charObj = STATE.getCharacter(charName);
             
-            if (charObj.pv <= 0) {
-                dest = "DeathPassage";
-                charObj.location = "DeathPassage";
+            const deathPaths = STATE.v.deathCriteria || [];
+            for (let prop of deathPaths) {
+                const val = charObj ? charObj[String(prop)] : undefined;
+                if (typeof val === 'number' && val <= 0) {
+                    dest = "DeathPassage";
+                    charObj.location = "DeathPassage";
+                    break;
+                }
             }
 
             if (isMe) {
@@ -848,6 +853,7 @@ $(document).on(':passagedisplay', function (ev) {
     { id: "c3", name: "Joueur 3", pv: 1 },
     { id: "c4", name: "Joueur 4", pv: 1 }
 ]>>
+<<set $deathCriteria to ["pv"]>>
 
 :: PassageHeader [configuration]
 <<nobr>>
@@ -1023,6 +1029,33 @@ Utilisez la boucle {{{characters}}} avec l'argument {{{here}}}.
 * {{{_character}}} {{{_char}}} (ou {{{_c}}}) : Variables temporaire représentant le personnage dans la boucle.
 * {{{_myCharacter}}} : Variable locale représentant le personnage du joueur qui regarde l'écran.
 
+[[Gestion de la mort des personnages|Mort]]
+
+:: Mort
+! Gestion de la mort
+La gestion de la mort est automatique : après que l'hôte ait appliqué les effets (dans {{{impact}}}), le moteur vérifie les propriétés listées dans {{{$deathCriteria}}}. Si l'une des propriétés vaut ''<= 0''', le personnage est considéré comme mort et sera redirigé vers {{{DeathPassage}}}.
+!! La variable {{{deathCriteria}}}
+* {{{deathCriteria}}} est une liste de noms de champs (ex. `["pv","faim"]`) qui sont lus sur chaque objet personnage.
+* Pour chaque personnage, le moteur récupère chaque champ nommé dans {{{deathCriteria}}} et teste sa valeur :
+* si la valeur est un nombre et ''<= 0''' → mort;
+* si la valeur est non numérique ou absente → ignorée.
+* Si ''au moins un critère'' est <= 0, le personnage meurt.
+!! Bonnes pratiques
+* Appliquez les changements d'état (PV, faim, soif, etc...) uniquement à l'intérieur d'un bloc {{{impact}}} — l'hôte exécutera ces changements pour tous.
+* N'écrivez pas de vérification manuelle du type {{{if _char.pv <= 0}}}, la redirection est automatique et ces tests sont redondants.
+* Vous pouvez ajouter d'autres critères (ex. `stamina`, `air`) en les ajoutant à {{{deathCriteria}}} dan le passage {{{StoryInit}}}.
+!! Exemple détaillé
+{{{
+<<set $deathCriteria to ["pv","faim"]>>
+<<impact>>
+    <<characters here>>
+        /* infligez dégâts et augmentez la faim ; si pv ou faim <= 0 => mort automatique */
+        <<set _char.pv -= 12>>
+        <<set _char.faim -= 1>>
+    <</characters>>
+<</impact>>
+}}}
+
 [[Passer à la pratique : Mode Individuel|Individual]]
 
 :: Individual [individual]
@@ -1043,7 +1076,7 @@ Sur vos différents onglets, essayez de répartir le groupe :
 :: Indiv_A
 <<impact>>
     <<characters here>>
-        <<set _char.pv += 10>>
+        <<set _char.pv -= 10>>
     <</characters>>
 <</impact>>
 ! Branche A : La Soirée Mousse
